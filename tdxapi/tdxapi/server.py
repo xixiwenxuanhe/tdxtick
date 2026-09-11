@@ -17,6 +17,8 @@ Notes:
     * `channel=order` needs the client's "逐笔委托明细" view open once.
 """
 import argparse
+import concurrent.futures
+import contextlib
 import json
 import os
 import pathlib
@@ -31,18 +33,66 @@ from . import config, history, live, orders, procinfo
 app = Flask(__name__)
 _state = {"pid": None, "lock": threading.Lock(), "current": None, "token": None}
 
+#: 等锁上限（秒）—— 超过即快速 503，不无限排队。
+LOCK_WAIT = float(os.environ.get("TDXAPI_LOCK_WAIT") or 15)
+#: history 请求硬上限（秒）。
+HISTORY_DEADLINE = float(os.environ.get("TDXAPI_HISTORY_DEADLINE") or 180)
+#: live 在 `seconds` 之外的额外宽限（秒）。
+LIVE_GRACE = float(os.environ.get("TDXAPI_LIVE_GRACE") or 30)
+#: SSE 连续失败多少次后结束流（避免对着坏掉的客户端空转）。
+STREAM_MAX_ERRORS = int(os.environ.get("TDXAPI_STREAM_MAX_ERRORS") or 5)
+
+_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="tdxapi")
+
+
+class Busy(Exception):
+    """另一个请求正占着客户端——快速失败，而不是排队等死。"""
+    code, name = 503, "busy"
+
+
+class Deadline(Exception):
+    """上游（FRIDA / 客户端 / .tck 下载器）超时。"""
+    code, name = 504, "timeout"
+
 
 def _pid():
     return _state["pid"]
 
 
-def _ensure(pid, code):
-    """Switch the client to `code` if needed (serialised)."""
-    with _state["lock"]:
-        if _state["current"] != code:
+def _bounded(fn, deadline, what):
+    """跑 `fn` 并施加硬上限；超时抛 Deadline。"""
+    fut = _pool.submit(fn)
+    try:
+        return fut.result(timeout=deadline)
+    except concurrent.futures.TimeoutError:
+        raise Deadline(f"{what} 超过 {deadline:g}s 未返回") from None
+
+
+@contextlib.contextmanager
+def _serialized(pid, code=None):
+    """序列化"驱动客户端"的工作；拿不到锁就立刻 503。
+
+    客户端同一时刻只能服务一只股（切股会替换缓冲），所以必须串行；
+    但**不能无限等** —— 曾经因为一个卡死的请求把后面全部拖死。
+    """
+    if not _state["lock"].acquire(timeout=LOCK_WAIT):
+        raise Busy(f"另一个请求正在使用客户端（等待 {LOCK_WAIT:g}s 未获得锁）")
+    try:
+        if code is not None and _state["current"] != code:
             from . import window
             window.switch_stock(pid, code, settle=3.0)
             _state["current"] = code
+        yield
+    finally:
+        _state["lock"].release()
+
+
+def _run_serialized(pid, code, fn, deadline, what):
+    """在串行区里跑 `fn`，并施加硬上限。"""
+    def job():
+        with _serialized(pid, code):
+            return fn()
+    return _bounded(job, deadline, what)
 
 
 @app.before_request
@@ -58,6 +108,27 @@ def _require_token():
     return None
 
 
+@app.errorhandler(Exception)
+def _json_error(e):
+    """Never return HTML error pages; callers need structured JSON."""
+    import werkzeug.exceptions as wexc
+    if isinstance(e, (Busy, Deadline)):
+        return jsonify(error=e.name, detail=str(e)), e.code
+    code = e.code if isinstance(e, wexc.HTTPException) else 400
+    name = "bad_request"
+    if isinstance(e, TimeoutError):
+        code, name = 504, "timeout"
+    elif isinstance(e, KeyError):
+        name = "missing_param"
+    elif isinstance(e, (ValueError, TypeError)):
+        name = "invalid_param"
+    elif isinstance(e, RuntimeError):
+        name = "runtime_error"
+    elif isinstance(e, wexc.NotFound):
+        name = "not_found"
+    return jsonify(error=name, detail=str(e)), code
+
+
 @app.get("/health")
 def health():
     try:
@@ -70,20 +141,22 @@ def health():
 
 @app.get("/v1/history/orders")
 def history_orders():
-    code, date = request.args["code"], request.args["date"]
+    code, date = request.args["code"], request.args["date"].replace("-", "")
     pid = _pid()
-    with _state["lock"]:
-        res = history.fetch(code, date.replace("-", ""), pid=pid, progress=lambda *_: None)
+    res = _run_serialized(pid, None,
+                          lambda: history.fetch(code, date, pid=pid, progress=lambda *_: None),
+                          HISTORY_DEADLINE, f"history {code}/{date}")
     return jsonify(code=res["summary"]["code"], date=res["summary"]["date"],
                    count=len(res["orders"]), records=res["orders"], summary=res["summary"])
 
 
 @app.get("/v1/history/trades")
 def history_trades():
-    code, date = request.args["code"], request.args["date"]
+    code, date = request.args["code"], request.args["date"].replace("-", "")
     pid = _pid()
-    with _state["lock"]:
-        res = history.fetch(code, date.replace("-", ""), pid=pid, progress=lambda *_: None)
+    res = _run_serialized(pid, None,
+                          lambda: history.fetch(code, date, pid=pid, progress=lambda *_: None),
+                          HISTORY_DEADLINE, f"history {code}/{date}")
     return jsonify(code=res["summary"]["code"], date=res["summary"]["date"],
                    count=len(res["trades"]), records=res["trades"], summary=res["summary"])
 
@@ -95,8 +168,10 @@ def v1_live():
     seconds = float(request.args.get("seconds", 4))
     from_now = request.args.get("from_now", "0") in ("1", "true", "yes")
     pid = _pid()
-    _ensure(pid, code)
-    recs = live.snapshot(pid=pid, code=None, seconds=seconds, channel=channel, from_now=from_now)
+    recs = _run_serialized(
+        pid, code,
+        lambda: live.snapshot(pid=pid, code=None, seconds=seconds, channel=channel, from_now=from_now),
+        seconds + LIVE_GRACE, f"live {code}/{channel}")
     return jsonify(code=code, channel=channel, count=len(recs), records=recs)
 
 
@@ -106,17 +181,30 @@ def v1_stream():
     channel = request.args.get("channel", "trade")
     interval = float(request.args.get("interval", 1.0))
     pid = _pid()
-    _ensure(pid, code)
+    with _serialized(pid, code):   # 只在这一刻切股，不长期占锁
+        pass
+    tail = f"{code}/{channel}"
 
     def gen():
         yield f": stream {code} {channel}\n\n"
-        last = 0
+        errors = 0
         while True:
             try:
-                recs = live.snapshot(pid=pid, code=None, seconds=interval, channel=channel, from_now=True)
+                recs = _bounded(
+                    lambda: live.snapshot(pid=pid, code=None, seconds=interval,
+                                          channel=channel, from_now=True),
+                    interval + LIVE_GRACE, f"live {tail}")
+                errors = 0
             except Exception as e:  # noqa: BLE001
-                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-                time.sleep(interval); continue
+                errors += 1
+                yield (f"event: error\ndata: "
+                       f"{json.dumps({'error': type(e).__name__, 'detail': str(e)})}\n\n")
+                if errors >= STREAM_MAX_ERRORS:
+                    yield (f"event: stop\ndata: "
+                           f"{json.dumps({'reason': 'too_many_errors'})}\n\n")
+                    return
+                time.sleep(interval)
+                continue
             for r in recs:
                 yield f"data: {json.dumps(r, ensure_ascii=False)}\n\n"
             if not recs:

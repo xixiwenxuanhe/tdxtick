@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import pathlib
 import struct
 import threading
@@ -58,9 +59,37 @@ rpc.exports = {
     if (!post(ptr(q.hwnd), 0x83f1, ptr(5522517), ptr(0))) { pending = null; return false; }
     return true;
   },
-  cancelPending() { if (active) return false; pending = null; return true; }
+  cancelPending() { if (active) return false; pending = null; return true; },
+  reset() { pending = null; active = false; return true; }
 };
 """
+
+#: 整次下载的硬超时（秒）。超过即放弃并抛 TimeoutError，**不再无限等**。
+#: 之前 finally 里的 `terminal.wait()` 无超时 —— 客户端一旦不回调就永久挂住，
+#: 同时占着文件锁和服务端全局锁，把后续所有请求拖死。
+DOWNLOAD_TIMEOUT = float(os.environ.get("TDXAPI_HISTORY_TIMEOUT") or 150)
+#: 把请求送进主线程后，多久没开始执行就判定主线程无响应。
+START_GRACE = float(os.environ.get("TDXAPI_HISTORY_START_GRACE") or 30)
+#: 收尾时等待/分离的宽限（秒），必须有界。
+DETACH_GRACE = float(os.environ.get("TDXAPI_HISTORY_DETACH_GRACE") or 10)
+
+
+def _cancel_pending(script):
+    """尽量清掉注入脚本里"下载中"的状态，失败不影响调用方。"""
+    if not script:
+        return
+    try:
+        script.exports_sync.cancel_pending()
+        script.exports_sync.reset()
+    except Exception:
+        pass
+
+
+def _safe_detach(session):
+    try:
+        session.detach()
+    except Exception:
+        pass
 
 
 def market_of(code):
@@ -132,12 +161,20 @@ def download(code, date, market, pid=None, progress=print):
                 raise RuntimeError("无法把请求送入通达信主线程。")
 
             begun = time.monotonic()
-            while not terminal.wait(10):
-                elapsed = int(time.monotonic() - begun)
-                progress(f"通达信正在获取 {code}/{date}，已等待 {elapsed}s", flush=True)
-                if not started.is_set() and elapsed >= 30:
-                    script.exports_sync.cancel_pending()
+            while True:
+                # 按“距截止还剩多少”自适应轮询，保证截止时间在 ~0.2s 内被兑现
+                left = DOWNLOAD_TIMEOUT - (time.monotonic() - begun)
+                if terminal.wait(min(10.0, max(0.2, left))):
+                    break
+                elapsed = time.monotonic() - begun
+                progress(f"通达信正在获取 {code}/{date}，已等待 {elapsed:.0f}s", flush=True)
+                if not started.is_set() and elapsed >= START_GRACE:
+                    _cancel_pending(script)
                     raise TimeoutError("通达信主线程没有响应；请检查是否登录或有弹窗。")
+                if elapsed >= DOWNLOAD_TIMEOUT:
+                    _cancel_pending(script)
+                    raise TimeoutError(
+                        f"通达信下载超时（>{elapsed:.0f}s）；客户端可能卡住，请稍后重试或重启客户端。")
             if result.get("error"):
                 raise RuntimeError(result["error"])
             if not result.get("ok") or not cache.is_file() or cache.stat().st_size <= 24:
@@ -146,13 +183,21 @@ def download(code, date, market, pid=None, progress=print):
                                request_date=date, request_code=code, request_market=market,
                                preclose_cache_backup=str(preclose_backup) if preclose_backup else None)
         finally:
-            if script and started.is_set() and not terminal.is_set():
-                terminal.wait()
+            # 先解锁：任何收尾步骤卡住都不应该把后续请求拖死。
+            try:
+                guard.seek(0); msvcrt.locking(guard.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+            _cancel_pending(script)
             if session:
-                session.detach()
+                # 分离操作也要有界——否则卡在这里同样会占住服务端锁。
+                _t = threading.Thread(target=_safe_detach, args=(session,), daemon=True)
+                _t.start(); _t.join(DETACH_GRACE)
             if preclose_backup and not result.get("ok") and not cache.exists():
-                preclose_backup.rename(cache)
-            guard.seek(0); msvcrt.locking(guard.fileno(), msvcrt.LK_UNLCK, 1)
+                try:
+                    preclose_backup.rename(cache)
+                except Exception:
+                    pass
 
 
 # --- decode --------------------------------------------------------------------
