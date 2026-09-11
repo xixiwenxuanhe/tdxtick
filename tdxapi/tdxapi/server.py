@@ -59,6 +59,17 @@ def _pid():
     return _state["pid"]
 
 
+def _coverage(code):
+    """把市场级的「委托流覆盖」标注带给调用方——沪市照深市经验写代码会静默算错。"""
+    try:
+        m = history.market_of(code)
+    except ValueError:
+        return {}
+    return {"market": m,
+            "coverage": history.COVERAGE.get(m, "unknown"),
+            "quantity_semantics": history.QUANTITY_SEMANTICS.get(m, "unknown")}
+
+
 def _bounded(fn, deadline, what):
     """跑 `fn` 并施加硬上限；超时抛 Deadline。"""
     fut = _pool.submit(fn)
@@ -172,7 +183,7 @@ def v1_live():
         pid, code,
         lambda: live.snapshot(pid=pid, code=None, seconds=seconds, channel=channel, from_now=from_now),
         seconds + LIVE_GRACE, f"live {code}/{channel}")
-    return jsonify(code=code, channel=channel, count=len(recs), records=recs)
+    return jsonify(**_coverage(code), code=code, channel=channel, count=len(recs), records=recs)
 
 
 @app.get("/v1/stream")

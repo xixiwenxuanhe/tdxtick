@@ -92,6 +92,16 @@ def _safe_detach(session):
         pass
 
 
+#: 各市场「委托流覆盖」级别。
+#: 沪市：上交所只发布"进入订单簿"的委托（"立即全部成交"的主动委托不发布）→ 只含挂单（被动方）；
+#: 深市：逐笔委托（UA201）发布全部委托。详见 docs/sh-vs-sz-tick-fields.md。
+COVERAGE = {1: "resting_only", 0: "full"}
+#: 委托记录 `quantity_shares` 的语义。
+#: 沪市：对"主动成交后又挂单"的委托，该字段是**成交后剩余量**，不是原始委托量；
+#: 深市：就是原始委托量。⇒ 沪市 `原始量 = 记录量 + 该委托的即时成交量`。
+QUANTITY_SEMANTICS = {1: "remaining_after_immediate_fill", 0: "original"}
+
+
 def market_of(code):
     code = code.lower()
     if code.startswith("sh"):
@@ -281,6 +291,8 @@ def fetch(code, date, market=None, pid=None, out_dir=None, progress=print):
     if not orders:
         raise ValueError("09:15-15:00 没有委托/撤单记录")
     summary = dict(code=code, date=date, market=market, **header,
+                   coverage=COVERAGE.get(market, "unknown"),
+                   quantity_semantics=QUANTITY_SEMANTICS.get(market, "unknown"),
                    tck_sha256=hashlib.sha256(blob).hexdigest(),
                    raw_sha256=hashlib.sha256(data).hexdigest(),
                    total_source_records=len(rows), session_records=len(session),

@@ -76,6 +76,10 @@ D:\Install\Miniconda\python.exe -m tdxapi.server --pid <TDX_PID> --port 8712
 - 委托：`time, price, shares, event(order|cancel), side(B|S), order_number`
   - ⚠️ 沪市：`shares` 对"主动成交后又挂单"的委托是**剩余量**而非原始量（见 FAQ）
 - 历史额外：`channel, sequence, order_price, time(ms)`
+- `summary` 里带市场级标注（`/v1/live` 也返回这两个字段）：
+  - `coverage`：沪市 `resting_only`（委托流只含挂单/被动方）／深市 `full`（完整逐笔委托）
+  - `quantity_semantics`：沪市 `remaining_after_immediate_fill`（`shares` 是**成交后剩余量**）／深市 `original`（原始委托量）
+  - 调用方应据此分支；照深市经验直接套在沪市上会**静默给出错误结论**（不报错，只是数不对）
 - 关联：用成交的 `bid_order_number`/`ask_order_number` 关联委托的 `order_number`，做订单流分析
 
 ## 已实现
@@ -113,7 +117,6 @@ D:\Install\Miniconda\python.exe -m tdxapi.server --pid <TDX_PID> --port 8712
 - **历史入 DuckDB / Parquet**：统一查询层与 keyset 分页
 - **SSE `/v1/stream` 多股订阅**（依赖多实例或 `orders_wire`）
 - **Token 轮换 / 多 Token**
-- **沪市记录加 `coverage: "resting_only"` 标注**，避免调用方误做订单存续重建
 
 ## 说明 / FAQ
 
@@ -124,7 +127,7 @@ D:\Install\Miniconda\python.exe -m tdxapi.server --pid <TDX_PID> --port 8712
   - 连续竞价阶段，"立即全部成交"的主动委托**不发布委托记录**（只发成交）；
   - 只有"成交后剩余"才在成交**之后**补发一条委托记录，之后再变化不再发；
   - 集合竞价期间不发逐笔，结束时统一补发，且**先发委托、再发成交**。
-  - 因此委托记录的 `quantity_shares` 是**剩余量**，不是原始量：`原始量 = 记录量 + 该委托的即时成交量`（实测 600000 有 637 笔暴露为"记录量 < 已成交量"，占 1.04%，修正后 0 笔真透支；深市 0）。
+  - 因此委托记录的 `quantity_shares` 是**剩余量**，不是原始量：`原始量 = 记录量 + 该委托的即时成交量`（实测 600000 有 784 笔到达即成交、占 1.3%，**贡献了当天 15.6% 的成交股数**；其中 637 笔暴露为"成交量 > 委托量"，修正后 0 笔真透支；深市 0）。
 - 深交所：根据《深圳证券交易所 STEP 行情数据接口规范》§4.4.5 ——
   - 逐笔委托（UA201）与逐笔成交（UA202）在**同一数据流统一连续编号**；
   - UA201 携带 `Price` / `OrderQty`（**原始委托价与委托量**），**每一笔委托都会发布**。
@@ -137,6 +140,7 @@ D:\Install\Miniconda\python.exe -m tdxapi.server --pid <TDX_PID> --port 8712
 - 影响：
   - 深市可做**完整订单账本**（`委托量 = 成交量 + 撤单量 + 剩余量` 闭环）
   - 沪市做不了完整账本，只能做「被动挂单 + 成交」类分析（被动撤单率、挂单存续、主动单聚合成交额）
-  - 沪市以"委托量"为分母的统计（大单识别、挂单规模、撤单率）在那 ~7% 上会**系统性低估**，
-    需按上述公式修正，且锚点用合并流的 `sequence` 邻接而非毫秒（毫秒会撞车）
+  - 沪市以"委托量"为分母的统计（大单识别、挂单规模、撤单率）在这批订单上会**系统性低估**，
+    且它们恰是活跃大单；修正需按上述公式，锚点用合并流的 `sequence` 邻接而非毫秒（毫秒会撞车）
+  - API 已在 `summary` 层给出 `coverage` / `quantity_semantics`，调用方可据此分支（见「数据字段」）
 - 完整推导见 `docs/sh-vs-sz-tick-fields.md`。
