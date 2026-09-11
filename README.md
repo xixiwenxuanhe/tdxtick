@@ -64,9 +64,11 @@ ords = orders.fetch_orders(code="000001", seconds=4)              # 实时委托
 
 ```ini
 TDX_PATH=D:\Install\tdx
+TDXAPI_TOKEN=changsheng252403     # 可选；不填则自动生成并保存到 .tdxtoken
 ```
 
-服务会自动：解析出 `TdxW.exe`、找到对应的通达信进程、绑定 **Tailscale 网卡**、生成并保存 Bearer Token 到 `.tdxtoken`（启动时会打印）。
+服务会自动：解析出 `TdxW.exe`、找到对应的通达信进程、绑定 **Tailscale 网卡**。
+Token 优先用 `.env` 里的 `TDXAPI_TOKEN`，没有就自动生成并保存到 `.tdxtoken`（启动时会打印）。
 
 启动（Windows，通达信需已登录）：
 
@@ -114,6 +116,25 @@ tdx_session.py     历史下载（通达信内部加载器）
 - `docs/realtime-findings.md` —— 实时内存布局、协议帧、命令码
 - `docs/decoder-reverse-engineering.md` —— 0x0554/0x055e 逐笔线协议逆向记录（含未完成部分）
 - `docs/snapshot-20260911.md` —— 2026-09-11 成果快照
+
+## 待实现 (TODO)
+
+### 高优先
+- [ ] **无视图实时委托 `orders_wire`** —— 直接往客户端已建立的行情 socket 注入 `0x055e` 请求，取任意股逐笔委托，**不依赖"逐笔委托明细"视图、也不用手动切股**。
+  - 现状：请求/响应链路已跑通（注入 `0x055e` + zlib 解压），**已验证能取到指定股数据**（客户端显示 603105 时成功取回 000001，约 1.5 万条）；见 `tdxapi/orders_wire.py`。
+  - 卡点：`0x055e` 响应是「逐记录差分 + 逐位置密钥(0x49)」的**变长字节流**，字段格式（price/num 的定点/浮点）与记录边界尚未完全解出。
+  - 下一步：交易时段抓「**严格对齐**的多记录连续帧」（线数据 + 内存缓冲增量逐帧核对），解差分密钥。详见 `docs/decoder-reverse-engineering.md` §9–§14。
+- [ ] **成交 ↔ 委托按订单号关联** —— 用成交的 `bid_order_number`/`ask_order_number` 关联委托的 `order_number`，提供订单流聚合接口。
+
+### 中优先
+- [ ] **多股并发** —— 当前一个实例同时只服务一只股（切股串行化）。方案：`fleet.py` 多实例，或基于 `orders_wire` 做免切股并发。
+- [ ] **服务常驻** —— 用 Windows 计划任务 / NSSM 包装 `run_node.ps1`，崩溃自启。
+- [ ] **收盘后自动回补当天数据** —— 每日约 15:30 自动下载自选股当天 `.tck` 并入库（历史接口的"当天"数据依赖此，服务端通常 15:30 后才生成）。
+
+### 低优先
+- [ ] 历史 `.tck` 解析结果入 **DuckDB/Parquet**，做统一查询层与 keyset 分页。
+- [ ] SSE `/v1/stream` 支持多股订阅（依赖多实例或 `orders_wire`）。
+- [ ] Token 轮换 / 多 Token。
 
 ## 免责声明
 
